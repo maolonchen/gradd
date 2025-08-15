@@ -1,0 +1,22 @@
+[
+  {
+    "DataGrading": "第一级",
+    "Priority": 1
+  },
+  {
+    "DataGrading": "第二级",
+    "Priority": 2
+  },
+  {
+    "DataGrading": "第三级",
+    "Priority": 3
+  },
+  {
+    "DataGrading": "第四级",
+    "Priority": 4
+  },
+  {
+    "DataGrading": "特别",
+    "Priority": 5
+  }
+]

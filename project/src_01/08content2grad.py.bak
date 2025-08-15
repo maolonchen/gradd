@@ -1,0 +1,212 @@
+import json
+import re
+import ast
+import asyncio
+import aiohttp
+from rich import print
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
+from cfg.settings import FINAL_PATH, POST_FINAL_PATH, LLM_API_URL, HEADERS, API_PAYLOAD
+from prompt.llm_prompt import CONTENT_TO_GRAD_PROMPT
+
+# 模型API配置
+API_URL = LLM_API_URL
+HEADERS = HEADERS
+
+# 输入输出文件路径
+input_file = FINAL_PATH
+output_file = POST_FINAL_PATH
+
+# 并发控制参数
+CONCURRENCY_LIMIT = 10  # 最大并发请求数
+REQUEST_TIMEOUT = 120   # 请求超时时间（秒）
+MAX_RETRIES = 10        # 最大重试次数
+
+def get_chinese_number(n):
+    """将数字转换为中文数字表示"""
+    chinese_numbers = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十"]
+    if n <= 10:
+        return chinese_numbers[n]
+    elif n <= 99:
+        # 处理11-99的中文表示
+        tens = n // 10
+        units = n % 10
+        if tens == 1:
+            return f"十{chinese_numbers[units]}" if units > 0 else "十"
+        else:
+            return f"{chinese_numbers[tens]}十{chinese_numbers[units]}" if units > 0 else f"{chinese_numbers[tens]}十"
+    else:
+        return str(n)  # 超过99直接使用阿拉伯数字
+
+def transform_json(original_json, new_str):
+    # 解析原始JSON
+    original = json.loads(original_json)
+    
+    # 找到"对应特征"的位置
+    header = original["header"]
+    feature_index = None
+    for key, value in header.items():
+        if value == "对应特征":
+            feature_index = int(key)
+            break
+    
+    if feature_index is None:
+        raise ValueError("原始JSON中未找到'对应特征'字段")
+    
+    # 获取前一个分类字段的名称
+    prev_key = str(feature_index - 1)
+    prev_class_name = header.get(prev_key, "")
+    
+    # 提取前一个分类的层级数字
+    match = re.search(r'([一二三四五六七八九十]+)级分类', prev_class_name)
+    if match:
+        # 从中文数字转换为阿拉伯数字
+        chinese_num = match.group(1)
+        chinese_to_num = {"一":1, "二":2, "三":3, "四":4, "五":5, "六":6, "七":7, "八":8, "九":9, "十":10, "十一":11, "十二":12}
+        prev_level = chinese_to_num.get(chinese_num, feature_index)
+        new_level = prev_level + 1
+        new_level_name = f"{get_chinese_number(new_level)}级分类"
+    else:
+        # 如果没有匹配到，使用位置推断
+        new_level = feature_index + 1
+        new_level_name = f"{get_chinese_number(new_level)}级分类"
+    
+    # 创建新的header结构
+    new_header = {}
+    new_data = {}
+    
+    # 重建header和data
+    new_key_index = 0
+    for key in sorted(header.keys(), key=int):
+        key_int = int(key)
+        
+        # 在"对应特征"前插入新分类
+        if key_int == feature_index:
+            new_header[str(new_key_index)] = new_level_name
+            new_data[str(new_key_index)] = new_str
+            new_key_index += 1
+        
+        # 复制原有字段
+        new_header[str(new_key_index)] = header[key]
+        new_data[str(new_key_index)] = original["data"][key]
+        new_key_index += 1
+    
+    return json.dumps({"header": new_header, "data": new_data}, ensure_ascii=False)
+
+@retry(
+    retry=retry_if_exception(lambda e: isinstance(e, (aiohttp.ClientError, asyncio.TimeoutError))),
+    stop=stop_after_attempt(MAX_RETRIES),
+    wait=wait_exponential(multiplier=1, min=4, max=60),
+    before_sleep=lambda retry_state: print(f"重试 {retry_state.attempt_number}/{MAX_RETRIES} 次..."),
+    reraise=True
+)
+
+async def call_model_api(session, prompt):
+    """异步调用模型API并返回结果"""
+    payload = API_PAYLOAD(prompt)
+    
+    try:
+        async with session.post(
+            API_URL, 
+            headers=HEADERS, 
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+        ) as response:
+            response.raise_for_status()
+            data = await response.json()
+            return data['choices'][0]['message']['content']
+    except Exception as e:
+        print(f"API调用失败: {str(e)}")
+        raise
+
+async def process_line(session, semaphore, line, index):
+    """处理单行数据"""
+    async with semaphore:
+        try:
+            data = json.loads(line)
+            # 查找"对应特征"列
+            feature_key = None
+            for key, value in data['header'].items():
+                if value == '对应特征':
+                    feature_key = key
+                    break
+            
+            if not feature_key:
+                print(f"行 {index}: 未找到'对应特征'列")
+                return index, line
+            
+            post_data = data['data'].get(feature_key, "")
+            print(f"行 {index}: =================================")
+            print(post_data)
+            prompt = CONTENT_TO_GRAD_PROMPT(post_data)
+            
+            # 调用模型API
+            model_response = await call_model_api(session, prompt)
+            model_response = model_response.split('</think>\n\n')[1]
+            if not model_response:
+                return index, line
+            
+            # 解析模型响应
+            try:
+                # 尝试处理可能的额外前缀
+                if '```json' in model_response:
+                    json_part = model_response.split('```json')[1].split('```')[0].strip()
+                    data_ = json.loads(json_part)
+                else:
+                    data_ = json.loads(model_response)
+                
+                # 如果返回的是字符串形式的字典
+                if isinstance(data_, str):
+                    data_ = json.loads(data_)
+            except (json.JSONDecodeError, SyntaxError):
+                # 尝试使用ast安全解析
+                try:
+                    data_ = ast.literal_eval(model_response)
+                except:
+                    print(f"行 {index}: 无法解析模型响应: {model_response}")
+                    return index, line
+            
+            print(f"行 {index}: {list(data_.keys())[0]}")
+            if list(data_.keys())[0] == "1":
+                tradata = transform_json(line, data_["1"])
+                print(f"行 {index}: 转换后的数据: {tradata}")
+                return index, tradata + '\n'
+            else:
+                return index, line
+                
+        except Exception as e:
+            print(f"行 {index}: 处理出错: {str(e)}")
+            return index, line
+
+async def process_data():
+    """异步处理JSONL文件数据"""
+    # 读取所有行
+    with open(input_file, 'r') as infile:
+        lines = infile.readlines()
+    
+    # 创建信号量控制并发
+    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+    
+    # 创建HTTP会话
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for i, line in enumerate(lines):
+            task = asyncio.create_task(process_line(session, semaphore, line, i))
+            tasks.append(task)
+        
+        # 等待所有任务完成
+        results = await asyncio.gather(*tasks)
+    
+    # 按原始顺序排序结果
+    results.sort(key=lambda x: x[0])
+    
+    # 写入输出文件
+    with open(output_file, 'w') as outfile:
+        for _, processed_line in results:
+            outfile.write(processed_line)
+
+def main():
+    asyncio.run(process_data())
+    print("数据处理完成！")
+
+if __name__ == "__main__":
+    main()
